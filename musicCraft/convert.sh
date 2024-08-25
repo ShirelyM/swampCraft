@@ -6,3 +6,4 @@ done
 
 cd $1
 rm -rf *.mp3
+rm -rf *.webm
