@@ -5,7 +5,6 @@ local MASTER_CODEX_URL = "https://raw.githubusercontent.com/ShirelyM/swampCraft/
 
 local LOCAL_CHUNK_SIZE = 16 * 1024
 local RADIO_CHUNK_SIZE = 4 * 1024
-local RADIO_PACE_FACTOR = 1.0
 
 local DEFAULT_VOLUME_LEVEL = 5
 local MIN_VOLUME_LEVEL = 1
@@ -792,7 +791,7 @@ local function playBroadcastQueueItem(response, item, commandId)
       })
 
       local chunkDuration = (#chunk * 8) / 48000
-      sleep(chunkDuration * RADIO_PACE_FACTOR)
+      sleep(chunkDuration * 0.85)
 
       state.radioSeq = state.radioSeq + 1
     end

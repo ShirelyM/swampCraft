@@ -10,7 +10,7 @@ local CONFIG_PATH = "musiccraft_receiver.cfg"
 local DEFAULT_CONFIG = {
   volume = 1.0,
   prebufferChunks = 8,
-  maxBufferChunks = 96,
+  maxBufferChunks = 64,
   listening = true,
 }
 
