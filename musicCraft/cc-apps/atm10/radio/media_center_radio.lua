@@ -1,15 +1,12 @@
--- VERIFY_MARKER: MC_RADIO_TX_V12_4_EXPLICIT_TRACK_BOUNDARY
--- MusicCraft Media Center v12 Broadcast TX
+-- VERIFY_MARKER: MC_RADIO_TX_V13_CONTINUOUS_SESSION
+-- MusicCraft Media Center v13 Broadcast TX
 -- CC:Tweaked / ATM10 / Streaming DFPWM / Monitor GUI / Broadcast Radio Transmitter
 
 local MASTER_CODEX_URL = "https://raw.githubusercontent.com/ShirelyM/swampCraft/refs/heads/dev/musicCraft/music/masterCodex.csv"
 
-local LOCAL_CHUNK_SIZE = 16 * 1024
-local RADIO_CHUNK_SIZE = 8 * 1024
-local RADIO_PACE_FACTOR = 0.93
-local RADIO_TRACK_GAP = 0.35
-local RADIO_ANNOUNCE_EVERY_CHUNKS = 8
-local RADIO_ANNOUNCE_INTERVAL = 1.0
+local STREAM_CHUNK_SIZE = 8 * 1024
+local RADIO_SEQ_MAX = 65535
+local RADIO_METADATA_EVERY_CHUNKS = 24
 
 local DEFAULT_VOLUME_LEVEL = 5
 local MIN_VOLUME_LEVEL = 1
@@ -19,11 +16,8 @@ local LOOP_OFF = "Off"
 local LOOP_SONG = "Song"
 local LOOP_QUEUE = "Queue"
 
-local OUTPUT_LOCAL = "Local"
-local OUTPUT_BROADCAST = "Broadcast"
 
 local RADIO_PROTOCOL = "musiccraft.radio.v1"
-local DISCOVERY_PROTOCOL = "musiccraft.radio.discovery.v1"
 
 local dfpwm = require("cc.audio.dfpwm")
 
@@ -34,7 +28,6 @@ if mon then mon.setTextScale(1) end
 
 local state = {
   library = { artists = {}, albumsByArtist = {}, albums = {} },
-
   speakers = {},
   buttons = {},
   itemButtons = {},
@@ -63,13 +56,13 @@ local state = {
   volumeLevel = DEFAULT_VOLUME_LEVEL,
   shuffleOn = false,
   loopMode = LOOP_OFF,
-  outputMode = OUTPUT_LOCAL,
+  radioEnabled = false,
 
   bytesRead = 0,
   totalBytes = nil,
 
   wirelessOpen = false,
-  radioStreamId = nil,
+  radioSessionId = nil,
   radioSeq = 1,
 
   status = "",
@@ -143,6 +136,7 @@ end
 
 local function splitCsvLine(line)
   local out, cur, quoted = {}, "", false
+
   for i = 1, #line do
     local c = line:sub(i, i)
     if c == "\"" then
@@ -154,6 +148,7 @@ local function splitCsvLine(line)
       cur = cur .. c
     end
   end
+
   table.insert(out, cur)
   return out
 end
@@ -178,6 +173,7 @@ end
 
 local function openWirelessModem()
   if state.wirelessOpen then return true end
+
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       local modem = peripheral.wrap(name)
@@ -189,11 +185,12 @@ local function openWirelessModem()
       end
     end
   end
+
   state.status = "No wireless modem found."
   return false
 end
 
-local function makeStreamId()
+local function makeSessionId()
   local t = os.epoch and os.epoch("utc") or math.floor(os.clock() * 1000)
   return tostring(os.getComputerID()) .. "-" .. tostring(t)
 end
@@ -206,19 +203,81 @@ local function radioBroadcast(msg)
   return true
 end
 
-local function radioStop()
-  if state.radioStreamId then
-    radioBroadcast({ type = "stop", streamId = state.radioStreamId })
-  else
-    radioBroadcast({ type = "stop" })
+local function nextRadioSeq()
+  local seq = state.radioSeq or 1
+  state.radioSeq = (seq % RADIO_SEQ_MAX) + 1
+  return seq
+end
+
+local function ensureRadioSession()
+  if not state.radioEnabled then return false end
+  if not openWirelessModem() then return false end
+
+  if not state.radioSessionId then
+    state.radioSessionId = makeSessionId()
+    state.radioSeq = 1
+    radioBroadcast({
+      type = "session_start",
+      sessionId = state.radioSessionId,
+      seq = state.radioSeq,
+      chunkSize = STREAM_CHUNK_SIZE,
+      seqMax = RADIO_SEQ_MAX
+    })
   end
+
+  return true
+end
+
+local function radioStop(reason)
+  if state.radioSessionId then
+    radioBroadcast({ type = "stop", sessionId = state.radioSessionId, reason = reason or "user_stop" })
+  else
+    radioBroadcast({ type = "stop", reason = reason or "user_stop" })
+  end
+  state.radioSessionId = nil
+  state.radioSeq = 1
+end
+
+local function radioSendMetadata(item)
+  if not item or not ensureRadioSession() then return end
+
+  radioBroadcast({
+    type = "metadata",
+    sessionId = state.radioSessionId,
+    title = item.track.title,
+    album = item.album.album,
+    artist = item.album.artist,
+    queuePos = state.queuePos,
+    queueLen = #state.queue,
+    trackIndex = item.index,
+    chunkSize = STREAM_CHUNK_SIZE,
+    seqMax = RADIO_SEQ_MAX
+  })
+end
+
+local function radioSendAudio(chunk)
+  if not chunk or not ensureRadioSession() then return end
+
+  local seq = nextRadioSeq()
+  radioBroadcast({
+    type = "audio",
+    sessionId = state.radioSessionId,
+    seq = seq,
+    data = chunk,
+    chunkSize = STREAM_CHUNK_SIZE,
+    seqMax = RADIO_SEQ_MAX
+  })
 end
 
 local function loadAlbumTracks(albumRecord)
   if albumRecord.tracks then return albumRecord.tracks end
+
   local text = httpReadText(albumRecord.codexUrl)
   local lines = {}
-  for line in text:gmatch("[^\r\n]+") do table.insert(lines, line) end
+
+  for line in text:gmatch("[^\r\n]+") do
+    table.insert(lines, line)
+  end
 
   local folderLink = ""
   if lines[2] then
@@ -228,8 +287,10 @@ local function loadAlbumTracks(albumRecord)
 
   local tracks = {}
   local inTracks = false
+
   for _, line in ipairs(lines) do
     local cols = splitCsvLine(line)
+
     if cols[1] == "trackNumber" then
       inTracks = true
     elseif inTracks and cols[1] and cols[1] ~= "" then
@@ -239,6 +300,7 @@ local function loadAlbumTracks(albumRecord)
         fileName = cols[3] or "",
         album = albumRecord
       }
+
       track.url = folderLink .. urlEncodePathPart(track.fileName)
       table.insert(tracks, track)
     end
@@ -266,11 +328,13 @@ local function loadMasterCodex()
     if not isHeader and artist and album and codexUrl and artist ~= "" and album ~= "" and codexUrl ~= "" then
       local record = { artist = artist, album = album, codexUrl = codexUrl, tracks = nil }
       table.insert(library.albums, record)
+
       if not seenArtists[artist] then
         seenArtists[artist] = true
         table.insert(library.artists, artist)
         library.albumsByArtist[artist] = {}
       end
+
       table.insert(library.albumsByArtist[artist], record)
     end
   end
@@ -279,6 +343,7 @@ local function loadMasterCodex()
   for _, artist in ipairs(library.artists) do
     table.sort(library.albumsByArtist[artist], function(a, b) return a.album < b.album end)
   end
+
   return library
 end
 
@@ -290,24 +355,30 @@ local function drawButton(id, x, y, w, label, bg, fg)
   bg = bg or C.button
   fg = fg or C.textDark
   label = trim(label, w)
+
   local padLeft = math.floor((w - #label) / 2)
   local padRight = w - #label - padLeft
   local text = string.rep(" ", math.max(0, padLeft)) .. label .. string.rep(" ", math.max(0, padRight))
+
   writeAt(x, y, text, fg, bg)
   state.buttons[id] = { x = x, y = y, w = w, h = 1 }
 end
 
 local function drawFrame()
   local w, h = display.getSize()
+
   clear()
+
   fill(1, 1, w, 1, C.borderOuter)
   fill(1, h, w, 1, C.borderOuter)
   fill(1, 1, 1, h, C.borderOuter)
   fill(w, 1, 1, h, C.borderOuter)
+
   fill(2, 2, w - 2, 1, C.borderInner)
   fill(2, h - 1, w - 2, 1, C.borderInner)
   fill(2, 2, 1, h - 2, C.borderInner)
   fill(w - 1, 2, 1, h - 2, C.borderInner)
+
   local title = " MusicCraft Media Center "
   writeAt(math.floor((w - #title) / 2), 1, title, C.borderOuter, C.borderInner)
 end
@@ -320,6 +391,7 @@ local function getVisibleList()
   elseif state.view == "songs" and state.selectedAlbum then
     return loadAlbumTracks(state.selectedAlbum)
   end
+
   return {}
 end
 
@@ -331,11 +403,12 @@ local function getHeader()
   elseif state.view == "songs" and state.selectedAlbum then
     return state.selectedAlbum.artist .. " > " .. state.selectedAlbum.album
   end
+
   return "Library"
 end
 
 local function progressColor()
-  if state.outputMode == OUTPUT_BROADCAST then
+  if state.radioEnabled then
     return C.broadcast
   elseif state.paused then
     return C.progressPaused
@@ -344,17 +417,21 @@ local function progressColor()
   elseif state.loopMode ~= LOOP_OFF then
     return C.progressLoop
   end
+
   return C.progressNormal
 end
 
 local function drawProgressBar(x, y, w)
   local pct = 0
+
   if state.totalBytes and state.totalBytes > 0 then
     pct = math.max(0, math.min(1, state.bytesRead / state.totalBytes))
   end
+
   local percentText = tostring(math.floor(pct * 100)) .. "%"
   local barW = math.max(5, w - 5)
   local filled = math.floor(barW * pct)
+
   fill(x, y, barW, 1, C.progressBg)
   if filled > 0 then fill(x, y, filled, 1, progressColor()) end
   writeAt(x + barW + 1, y, percentText, C.text, C.bg)
@@ -362,9 +439,11 @@ end
 
 local function drawGui()
   local w, h = display.getSize()
+
   local panelW = 14
   local panelX = w - panelW
   local buttonX = panelX + 1
+
   local listX, listY = 4, 5
   local listW = panelX - listX - 2
   local listH = h - 12
@@ -374,6 +453,7 @@ local function drawGui()
 
   drawFrame()
   writeAt(4, 3, trim(getHeader(), listW), C.accent, C.bg)
+
   fill(panelX - 1, 2, 1, h - 3, C.borderInner)
 
   local ppLabel = ">"
@@ -387,12 +467,15 @@ local function drawGui()
   drawButton("play_pause", buttonX + 3, 4, 2, ppLabel, ppColor, C.textDark)
   drawButton("stop", buttonX + 7, 4, 2, "[]", C.danger, C.text)
   drawButton("next", buttonX + 10, 4, 2, ">>", C.button)
-  drawButton("output", buttonX, 6, 12, "Out:" .. state.outputMode, state.outputMode == OUTPUT_BROADCAST and C.broadcast or C.button, state.outputMode == OUTPUT_BROADCAST and C.text or C.textDark)
+
+  drawButton("radio", buttonX, 6, 12, "Radio:" .. (state.radioEnabled and "On" or "Off"), state.radioEnabled and C.broadcast or C.button, state.radioEnabled and C.text or C.textDark)
   drawButton("shuffle", buttonX, 8, 12, "Shuffle", state.shuffleOn and C.active or C.button)
   drawButton("loop", buttonX, 10, 12, "Loop: " .. state.loopMode, state.loopMode ~= LOOP_OFF and C.active or C.button)
+
   drawButton("vol_down", buttonX, 12, 2, "-", C.button)
   drawButton("vol_mid", buttonX + 4, 12, 4, tostring(state.volumeLevel), C.button)
   drawButton("vol_up", buttonX + 10, 12, 2, "+", C.button)
+
   drawButton("up", buttonX, 14, 4, "Up", C.button)
   drawButton("down", buttonX + 8, 14, 4, "Dn", C.button)
 
@@ -401,32 +484,36 @@ local function drawGui()
   end
 
   local list = getVisibleList()
+
   for row = 0, listH - 1 do
     local i = state.scroll + row
     local item = list[i]
     local y = listY + row
+
     if item then
       local bg = row % 2 == 0 and C.bg2 or C.bg
       local fg = row % 2 == 0 and C.textDark or C.text
       local text = ""
+
       if state.view == "artists" then
         text = item
       elseif state.view == "albums" then
         text = item.album
       elseif state.view == "songs" then
         text = item.trackNumber .. ". " .. item.title
+
         if state.currentAlbum == state.selectedAlbum and i == state.currentIndex then
           bg, fg = C.selected, C.textDark
         end
       end
+
       fill(listX, y, listW, 1, bg)
       writeAt(listX + 1, y, trim(text, listW - 2), fg, bg)
       state.itemButtons[i] = { x = listX, y = y, w = listW, h = 1 }
     end
   end
 
-  local now = "Now Playing: "
-  now = now .. (state.currentTrack and state.currentTrack.title or "Nothing")
+  local now = "Now Playing: " .. (state.currentTrack and state.currentTrack.title or "Nothing")
   writeAt(4, h - 6, trim(now, listW), C.text, C.bg)
   writeAt(4, h - 5, trim("Status: " .. tostring(state.status or ""), listW), C.text, C.bg)
   drawProgressBar(4, h - 4, listW)
@@ -435,15 +522,18 @@ end
 local function shuffleList(list)
   local out = {}
   for i = 1, #list do out[i] = list[i] end
+
   for i = #out, 2, -1 do
     local j = math.random(i)
     out[i], out[j] = out[j], out[i]
   end
+
   return out
 end
 
 local function addAlbumToQueue(queue, albumRecord)
   local tracks = loadAlbumTracks(albumRecord)
+
   for i, track in ipairs(tracks) do
     table.insert(queue, { album = albumRecord, index = i, track = track })
   end
@@ -451,38 +541,47 @@ end
 
 local function buildQueueFromContext(startIndex, shuffled)
   local queue = {}
+
   if state.view == "songs" and state.selectedAlbum then
     local tracks = loadAlbumTracks(state.selectedAlbum)
+
     for i = startIndex or 1, #tracks do
       table.insert(queue, { album = state.selectedAlbum, index = i, track = tracks[i] })
     end
+
   elseif state.view == "albums" and state.selectedArtist then
     local albums = state.library.albumsByArtist[state.selectedArtist] or {}
     for _, albumRecord in ipairs(albums) do addAlbumToQueue(queue, albumRecord) end
+
   elseif state.view == "artists" then
     for _, albumRecord in ipairs(state.library.albums) do addAlbumToQueue(queue, albumRecord) end
+
   elseif state.currentAlbum then
     local tracks = loadAlbumTracks(state.currentAlbum)
     for i = state.currentIndex or 1, #tracks do
       table.insert(queue, { album = state.currentAlbum, index = i, track = tracks[i] })
     end
   end
+
   if shuffled then queue = shuffleList(queue) end
   return queue
 end
 
 local function startQueue(queue, startPos)
   if #queue == 0 then return end
+
   state.commandId = state.commandId + 1
   state.command = { id = state.commandId, queue = queue, startPos = startPos or 1 }
+
   state.queue = queue
   state.queuePos = startPos or 1
   state.stopRequested = true
   state.paused = false
   state.bytesRead = 0
   state.totalBytes = nil
+
   stopSpeakers()
-  radioStop()
+  -- Only send radio stop for user-directed restarts/skips; no artificial stop between natural tracks.
   drawGui()
 end
 
@@ -496,7 +595,6 @@ local function requestContextPlay()
   if state.playing then
     state.paused = true
     stopSpeakers()
-    if state.outputMode == OUTPUT_BROADCAST then radioStop() end
     drawGui()
     return
   end
@@ -505,6 +603,7 @@ local function requestContextPlay()
   if state.view == "songs" and state.selectedAlbum and state.currentAlbum == state.selectedAlbum and state.currentIndex then
     startIndex = state.currentIndex
   end
+
   startQueue(buildQueueFromContext(startIndex, state.shuffleOn), 1)
 end
 
@@ -525,17 +624,28 @@ local function cycleLoop()
   else
     state.loopMode = LOOP_OFF
   end
+
   drawGui()
 end
 
-local function toggleOutput()
-  if state.outputMode == OUTPUT_LOCAL then
-    state.outputMode = OUTPUT_BROADCAST
-    openWirelessModem()
+local function toggleRadio()
+  state.radioEnabled = not state.radioEnabled
+
+  if state.radioEnabled then
+    if ensureRadioSession() then
+      if state.currentTrack and state.currentAlbum then
+        radioSendMetadata({ album = state.currentAlbum, index = state.currentIndex or 0, track = state.currentTrack })
+      end
+      state.status = "Radio on; local playback remains active."
+    else
+      state.radioEnabled = false
+      state.status = "Radio unavailable; no wireless modem."
+    end
   else
-    state.outputMode = OUTPUT_LOCAL
-    radioStop()
+    radioStop("radio_off")
+    state.status = "Radio off; local playback continues."
   end
+
   drawGui()
 end
 
@@ -568,6 +678,7 @@ local function playBufferAll(buffer, commandId)
     if state.paused then return false end
 
     local waiting = false
+
     for i, speaker in ipairs(state.speakers) do
       if pending[i] then
         if speaker.playAudio(buffer, speakerVolume()) then
@@ -590,16 +701,30 @@ local function getContentLength(response)
   return tonumber(headers["Content-Length"] or headers["content-length"])
 end
 
-local function playLocalQueueItem(response, commandId)
+local function playQueueItemStream(response, item, commandId)
   local decoder = dfpwm.make_decoder()
+  local chunksSinceMetadata = RADIO_METADATA_EVERY_CHUNKS
+
   while not state.quit and not state.stopRequested and state.commandId == commandId do
     if state.paused then
       sleep(0.1)
     else
-      local chunk = response.read(LOCAL_CHUNK_SIZE)
+      local chunk = response.read(STREAM_CHUNK_SIZE)
       if not chunk then break end
+
       state.bytesRead = state.bytesRead + #chunk
+
+      if state.radioEnabled then
+        if chunksSinceMetadata >= RADIO_METADATA_EVERY_CHUNKS then
+          radioSendMetadata(item)
+          chunksSinceMetadata = 0
+        end
+        radioSendAudio(chunk)
+        chunksSinceMetadata = chunksSinceMetadata + 1
+      end
+
       local ok = playBufferAll(decoder(chunk), commandId)
+
       if not ok then
         while state.paused and not state.quit and not state.stopRequested and state.commandId == commandId do sleep(0.1) end
         if state.stopRequested or state.quit or state.commandId ~= commandId then break end
@@ -608,107 +733,10 @@ local function playLocalQueueItem(response, commandId)
   end
 end
 
-local function playBroadcastQueueItem(response, item, commandId)
-  if not openWirelessModem() then
-    state.status = "Broadcast unavailable; no wireless modem."
-    drawGui()
-    sleep(1)
-    return
-  end
-
-  -- Explicit track boundary: tell receivers to fully close any prior stream
-  -- before the next song starts. This prevents stale playback state from
-  -- carrying across queue items.
-  if state.radioStreamId then
-    radioBroadcast({
-      type = "stop",
-      streamId = state.radioStreamId,
-      reason = "next_track"
-    })
-    sleep(RADIO_TRACK_GAP)
-  end
-
-  state.radioStreamId = makeStreamId()
-  state.radioSeq = 1
-
-  local streamMeta = {
-    type = "announce",
-    streamId = state.radioStreamId,
-    title = item.track.title,
-    album = item.album.album,
-    artist = item.album.artist,
-    chunkSize = RADIO_CHUNK_SIZE,
-    currentSeq = 0,
-    status = "playing"
-  }
-
-  local function sendAnnounce()
-    streamMeta.currentSeq = state.radioSeq
-    streamMeta.status = state.paused and "paused" or "playing"
-    radioBroadcast(streamMeta)
-  end
-
-  sendAnnounce()
-  radioBroadcast({
-    type = "start",
-    streamId = state.radioStreamId,
-    title = item.track.title,
-    album = item.album.album,
-    artist = item.album.artist,
-    chunkSize = RADIO_CHUNK_SIZE,
-    joinSeq = 1,
-    hardReset = true
-  })
-
-  local announceTimer = os.startTimer(RADIO_ANNOUNCE_INTERVAL)
-
-  while not state.quit and not state.stopRequested and state.commandId == commandId do
-    local chunk = nil
-
-    if state.paused then
-      local e, timerId = os.pullEvent("timer")
-      if timerId == announceTimer then
-        sendAnnounce()
-        announceTimer = os.startTimer(RADIO_ANNOUNCE_INTERVAL)
-      end
-    else
-      chunk = response.read(RADIO_CHUNK_SIZE)
-      if not chunk then break end
-
-      state.bytesRead = state.bytesRead + #chunk
-
-      radioBroadcast({
-        type = "audio",
-        streamId = state.radioStreamId,
-        seq = state.radioSeq,
-        data = chunk,
-        title = item.track.title,
-        album = item.album.album,
-        artist = item.album.artist,
-        chunkSize = RADIO_CHUNK_SIZE
-      })
-
-      -- Announce is intentionally independent of audio packet count.
-      -- This allows receivers powered on mid-song to discover and join the active stream.
-      if state.radioSeq == 1 or state.radioSeq % 8 == 0 then
-        sendAnnounce()
-      end
-
-      local chunkDuration = (#chunk * 8) / 48000
-      sleep(chunkDuration * RADIO_PACE_FACTOR)
-      state.radioSeq = state.radioSeq + 1
-    end
-  end
-
-  if state.radioStreamId then
-    radioBroadcast({ type = "end", streamId = state.radioStreamId, finalSeq = state.radioSeq - 1 })
-  end
-end
-
 local function playQueueItem(item, commandId)
   refreshSpeakers()
 
-  if state.outputMode == OUTPUT_LOCAL and #state.speakers == 0 then
+  if #state.speakers == 0 then
     state.status = "No local speakers found."
     drawGui()
     sleep(1)
@@ -723,10 +751,12 @@ local function playQueueItem(item, commandId)
   state.stopRequested = false
   state.bytesRead = 0
   state.totalBytes = nil
-  state.status = state.outputMode == OUTPUT_BROADCAST and "Broadcasting..." or "Playing locally..."
+  state.status = state.radioEnabled and "Playing locally + broadcasting..." or "Playing locally..."
+
   drawGui()
 
   local response, err = http.get(item.track.url, nil, true)
+
   if not response then
     state.playing = false
     state.status = "HTTP failed: " .. tostring(err)
@@ -751,18 +781,14 @@ local function playQueueItem(item, commandId)
     end
   end
 
-  if state.outputMode == OUTPUT_BROADCAST then
-    parallel.waitForAny(function() playBroadcastQueueItem(response, item, commandId) end, progressLoop)
-  else
-    parallel.waitForAny(function() playLocalQueueItem(response, commandId) end, progressLoop)
-  end
+  radioSendMetadata(item)
+  parallel.waitForAny(function() playQueueItemStream(response, item, commandId) end, progressLoop)
 
   response.close()
   state.playing = false
 
   if state.stopRequested or state.commandId ~= commandId then
     stopSpeakers()
-    if state.outputMode == OUTPUT_BROADCAST then radioStop() end
   end
 
   drawGui()
@@ -780,6 +806,7 @@ local function playerLoop()
       while pos <= #cmd.queue and not state.quit and state.commandId == cmd.id do
         state.queue = cmd.queue
         state.queuePos = pos
+
         local completed = playQueueItem(cmd.queue[pos], cmd.id)
         if not completed then break end
 
@@ -806,6 +833,7 @@ local function goBack()
     state.selectedArtist = nil
     state.scroll = 1
   end
+
   drawGui()
 end
 
@@ -820,12 +848,14 @@ local function selectItem(index)
     state.view = "albums"
     state.scroll = 1
     drawGui()
+
   elseif state.view == "albums" then
     state.selectedAlbum = item
     state.view = "songs"
     state.scroll = 1
     loadAlbumTracks(item)
     drawGui()
+
   elseif state.view == "songs" then
     startQueue(buildQueueFromContext(index, state.shuffleOn), 1)
   end
@@ -833,7 +863,9 @@ end
 
 local function isTouchBounce(x, y)
   local now = os.clock()
+
   if state.lastTouchX == x and state.lastTouchY == y and now - state.lastTouchTime < 0.35 then return true end
+
   state.lastTouchX = x
   state.lastTouchY = y
   state.lastTouchTime = now
@@ -845,61 +877,109 @@ local function handleTouch(x, y)
 
   for id, b in pairs(state.buttons) do
     if inside(b, x, y) then
-      if id == "play_pause" then requestContextPlay()
+      if id == "play_pause" then
+        requestContextPlay()
+
       elseif id == "stop" then
         state.command = nil
         state.stopRequested = true
         state.paused = false
         state.playing = false
         stopSpeakers()
-        radioStop()
+        radioStop("user_stop")
         drawGui()
-      elseif id == "next" then requestNext()
-      elseif id == "previous" then requestPrevious()
-      elseif id == "output" then toggleOutput()
-      elseif id == "shuffle" then requestShuffle()
-      elseif id == "loop" then cycleLoop()
-      elseif id == "vol_down" then state.volumeLevel = math.max(MIN_VOLUME_LEVEL, state.volumeLevel - 1); drawGui()
-      elseif id == "vol_up" then state.volumeLevel = math.min(MAX_VOLUME_LEVEL, state.volumeLevel + 1); drawGui()
-      elseif id == "back" then goBack()
-      elseif id == "up" then if state.scroll > 1 then state.scroll = state.scroll - 1 end; drawGui()
-      elseif id == "down" then local list = getVisibleList(); if state.scroll < #list then state.scroll = state.scroll + 1 end; drawGui()
+
+      elseif id == "next" then
+        requestNext()
+
+      elseif id == "previous" then
+        requestPrevious()
+
+      elseif id == "radio" then
+        toggleRadio()
+
+      elseif id == "shuffle" then
+        requestShuffle()
+
+      elseif id == "loop" then
+        cycleLoop()
+
+      elseif id == "vol_down" then
+        state.volumeLevel = math.max(MIN_VOLUME_LEVEL, state.volumeLevel - 1)
+        drawGui()
+
+      elseif id == "vol_up" then
+        state.volumeLevel = math.min(MAX_VOLUME_LEVEL, state.volumeLevel + 1)
+        drawGui()
+
+      elseif id == "back" then
+        goBack()
+
+      elseif id == "up" then
+        if state.scroll > 1 then state.scroll = state.scroll - 1 end
+        drawGui()
+
+      elseif id == "down" then
+        local list = getVisibleList()
+        if state.scroll < #list then state.scroll = state.scroll + 1 end
+        drawGui()
       end
+
       return
     end
   end
 
   for index, b in pairs(state.itemButtons) do
-    if inside(b, x, y) then selectItem(index); return end
+    if inside(b, x, y) then
+      selectItem(index)
+      return
+    end
   end
 end
 
 local function uiLoop()
   while not state.quit do
     local e, p1, p2, p3 = os.pullEvent()
+
     if e == "monitor_touch" then
       handleTouch(p2, p3)
+
     elseif e == "char" then
       if p1 == "q" then
         state.quit = true
         state.stopRequested = true
         stopSpeakers()
-        radioStop()
+        radioStop("quit")
         clear()
-      elseif p1 == "p" then requestContextPlay()
+
+      elseif p1 == "p" then
+        requestContextPlay()
+
       elseif p1 == "s" then
         state.command = nil
         state.stopRequested = true
         state.paused = false
         state.playing = false
         stopSpeakers()
-        radioStop()
+        radioStop("user_stop")
         drawGui()
-      elseif p1 == "n" then requestNext()
-      elseif p1 == "r" then toggleOutput()
-      elseif p1 == "b" then goBack()
-      elseif p1 == "+" then state.volumeLevel = math.min(MAX_VOLUME_LEVEL, state.volumeLevel + 1); drawGui()
-      elseif p1 == "-" then state.volumeLevel = math.max(MIN_VOLUME_LEVEL, state.volumeLevel - 1); drawGui()
+
+      elseif p1 == "n" then
+        requestNext()
+
+      elseif p1 == "r" then
+        toggleRadio()
+
+      elseif p1 == "b" then
+        goBack()
+
+      elseif p1 == "+" then
+        state.volumeLevel = math.min(MAX_VOLUME_LEVEL, state.volumeLevel + 1)
+        drawGui()
+
+      elseif p1 == "-" then
+        state.volumeLevel = math.max(MIN_VOLUME_LEVEL, state.volumeLevel - 1)
+        drawGui()
       end
     end
   end
@@ -907,12 +987,16 @@ end
 
 local function main()
   if not http then error("HTTP is disabled.") end
+
   math.randomseed(os.epoch and os.epoch("utc") or os.clock())
+
   refreshSpeakers()
   clear()
   writeAt(1, 1, "Loading master codex...", C.text, C.bg)
+
   state.library = loadMasterCodex()
   drawGui()
+
   parallel.waitForAny(uiLoop, playerLoop)
 end
 

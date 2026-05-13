@@ -1,12 +1,11 @@
--- VERIFY_MARKER: MC_RADIO_RX_V12_5_HARD_STREAM_RESET_NEXT_TRACK
--- MusicCraft Radio Receiver v12.5
--- Broadcast Receiver with late-join support and non-blocking network intake
--- CC:Tweaked / ATM10 / No Computronics
+-- VERIFY_MARKER: MC_RADIO_RX_V13_CONTINUOUS_SESSION
+-- MusicCraft Radio Receiver v13
+-- CC:Tweaked / ATM10 / Continuous Broadcast DFPWM Receiver
 
 local RADIO_PROTOCOL = "musiccraft.radio.v1"
-local DISCOVERY_PROTOCOL = "musiccraft.radio.discovery.v1"
 local ROLE_PREFIX = "musiccraft-rx"
 local CONFIG_PATH = "musiccraft_receiver.cfg"
+local RADIO_SEQ_MAX = 65535
 
 local DEFAULT_CONFIG = {
   volume = 1.0,
@@ -29,11 +28,11 @@ local function loadConfig()
     local h = fs.open(CONFIG_PATH, "r")
     local text = h.readAll()
     h.close()
+
     local ok, data = pcall(textutils.unserialize, text)
-    if ok and type(data) == "table" then
-      return copyDefaults(data, DEFAULT_CONFIG)
-    end
+    if ok and type(data) == "table" then return copyDefaults(data, DEFAULT_CONFIG) end
   end
+
   return copyDefaults({}, DEFAULT_CONFIG)
 end
 
@@ -56,72 +55,23 @@ local function sanitizeName(name)
 end
 
 local function openWirelessModem()
-  -- Best path: CC:Tweaked can often find both attached and pocket modems
-  -- through peripheral.find, even when peripheral.getNames() is not helpful.
-  local modemName = nil
-  local modem = peripheral.find("modem", function(name, wrapped)
-    if wrapped and wrapped.isWireless and wrapped.isWireless() then
-      modemName = name
-      return true
-    end
-    return false
-  end)
-
-  if modemName and modem then
-    if not rednet.isOpen(modemName) then rednet.open(modemName) end
-    return modemName
-  end
-
-  -- Fallback for normal attached modems.
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
-      local wrapped = peripheral.wrap(name)
-      if wrapped and wrapped.isWireless and wrapped.isWireless() then
+      local modem = peripheral.wrap(name)
+      if modem and modem.isWireless and modem.isWireless() then
         if not rednet.isOpen(name) then rednet.open(name) end
         return name
       end
     end
   end
 
-  -- Pocket computer fallback:
-  -- Some pocket computers expose the internal wireless modem on a side even
-  -- when it does not appear in peripheral.getNames(). Try every side.
-  local candidates = { "back", "left", "right", "top", "bottom", "front" }
-  for _, side in ipairs(candidates) do
-    local ok = pcall(function()
-      rednet.open(side)
-    end)
-
-    if ok and rednet.isOpen(side) then
-      return side .. " (pocket/internal)"
-    end
-  end
-
-  -- Final diagnostic to make the failure actionable in-game.
-  print("Wireless modem detection failed.")
-  print("Computer ID: " .. tostring(os.getComputerID()))
-  print("Computer label: " .. tostring(os.getComputerLabel()))
-  print("Attached peripherals:")
-  local names = peripheral.getNames()
-  if #names == 0 then
-    print("  none")
-  else
-    for _, name in ipairs(names) do
-      print("  " .. name .. " : " .. tostring(peripheral.getType(name)))
-    end
-  end
-  print()
-  print("This receiver requires one of:")
-  print("  - attached wireless modem")
-  print("  - Advanced Wireless Pocket Computer")
-  print("  - Advanced Noisy Pocket Computer with wireless support")
-
-  error("No usable wireless modem side could be opened.")
+  error("No attached wireless modem found.")
 end
 
 local function ensureComputerLabel()
   local label = os.getComputerLabel()
   if label and label ~= "" then return sanitizeName(label) end
+
   local generated = ROLE_PREFIX .. "-" .. tostring(os.getComputerID())
   os.setComputerLabel(generated)
   return generated
@@ -149,25 +99,49 @@ local modemName = openWirelessModem()
 local HOSTNAME = claimUniqueHostname()
 
 local state = {
-  streamId = nil,
+  sessionId = nil,
   title = nil,
   album = nil,
   artist = nil,
+  queuePos = nil,
+  queueLen = nil,
+  trackIndex = nil,
+
   decoder = nil,
   buffer = {},
   expectedSeq = nil,
+  seqMax = RADIO_SEQ_MAX,
+
   receiving = false,
   playing = false,
-  ended = false,
+
   underruns = 0,
   chunksReceived = 0,
   chunksPlayed = 0,
   chunksDropped = 0,
   outOfOrder = 0,
-  lastSender = nil,
+
   lastStatus = "Idle.",
-  lastAnnounceClock = 0,
 }
+
+local function seqNext(seq)
+  return (seq % state.seqMax) + 1
+end
+
+local function seqDistanceForward(fromSeq, toSeq)
+  if not fromSeq or not toSeq then return nil end
+  local maxSeq = state.seqMax or RADIO_SEQ_MAX
+  if toSeq >= fromSeq then return toSeq - fromSeq end
+  return (maxSeq - fromSeq) + toSeq
+end
+
+local function isSeqOlder(seq, expected)
+  if not seq or not expected then return false end
+  local maxSeq = state.seqMax or RADIO_SEQ_MAX
+  local forward = seqDistanceForward(expected, seq)
+  if forward == 0 then return false end
+  return forward > (maxSeq / 2)
+end
 
 local function drawStatus()
   term.setBackgroundColor(colors.black)
@@ -175,12 +149,11 @@ local function drawStatus()
   term.clear()
   term.setCursorPos(1, 1)
 
-  print("MusicCraft Radio Receiver v12.5")
-  print("============================")
+  print("MusicCraft Radio Receiver v13")
+  print("==============================")
   print("Name:       " .. HOSTNAME)
   print("ID:         " .. os.getComputerID())
   print("Modem:      " .. tostring(modemName))
-  print("Protocol:   " .. RADIO_PROTOCOL)
   print("Listening:  " .. tostring(config.listening))
   print("Volume:     " .. tostring(config.volume))
   print("Prebuffer:  " .. tostring(config.prebufferChunks))
@@ -190,7 +163,9 @@ local function drawStatus()
   print("Playing:    " .. tostring(state.playing))
   print("Title:      " .. tostring(state.title or "-"))
   print("Artist:     " .. tostring(state.artist or "-"))
-  print("Stream:     " .. tostring(state.streamId or "-"))
+  print("Album:      " .. tostring(state.album or "-"))
+  print("Queue:      " .. tostring(state.queuePos or "-") .. "/" .. tostring(state.queueLen or "-"))
+  print("Session:    " .. tostring(state.sessionId or "-"))
   print("Expected:   " .. tostring(state.expectedSeq or "-"))
   print("Received:   " .. tostring(state.chunksReceived))
   print("Played:     " .. tostring(state.chunksPlayed))
@@ -198,27 +173,21 @@ local function drawStatus()
   print("OutOrder:   " .. tostring(state.outOfOrder))
   print("Underruns:  " .. tostring(state.underruns))
   print()
-  print("Keys: b listen | +/- volume | [/] prebuffer | {/} maxbuf | s stop | q quit")
+  print("Keys: b listen | +/- vol | [/] prebuf | {/} maxbuf | s stop | q quit")
   print()
   print(state.lastStatus or "")
 end
 
-local function resetStream(msg, senderId, join)
-  -- Hard reset playback/decoder/buffer for every new stream. This is critical
-  -- when the transmitter advances to the next queued song.
+local function hardResetSession(sessionId, startSeq, reason)
   pcall(function() speaker.stop() end)
 
-  state.streamId = msg.streamId
-  state.title = msg.title or "Unknown Stream"
-  state.album = msg.album
-  state.artist = msg.artist
+  state.sessionId = sessionId
   state.decoder = dfpwm.make_decoder()
   state.buffer = {}
+  state.expectedSeq = tonumber(startSeq or 1) or 1
 
-  state.expectedSeq = tonumber(msg.joinSeq or msg.currentSeq or 1)
   state.receiving = true
   state.playing = false
-  state.ended = false
 
   state.underruns = 0
   state.chunksReceived = 0
@@ -226,95 +195,93 @@ local function resetStream(msg, senderId, join)
   state.chunksDropped = 0
   state.outOfOrder = 0
 
-  state.lastSender = senderId
-  state.lastAnnounceClock = os.clock()
-
-  -- A second stop after state reset helps clear any queued speaker samples.
-  pcall(function() speaker.stop() end)
-
-  if join then
-    state.lastStatus = "Joining stream near chunk " .. tostring(state.expectedSeq) .. "."
-  else
-    state.lastStatus = "Starting new stream at chunk " .. tostring(state.expectedSeq) .. "."
-  end
-
+  state.lastStatus = reason or ("Joined session at seq " .. tostring(state.expectedSeq) .. ".")
   drawStatus()
 end
 
-local function stopStream(reason)
+local function stopSession(reason)
   pcall(function() speaker.stop() end)
-  state.lastStatus = "Stream stopped: " .. tostring(reason or "unknown")
+
   state.receiving = false
   state.playing = false
-  state.ended = false
   state.buffer = {}
   state.expectedSeq = nil
   state.decoder = nil
+  state.sessionId = nil
+  state.lastStatus = "Stopped: " .. tostring(reason or "unknown")
+
   drawStatus()
 end
 
-local function handleAnnounce(msg, senderId)
+local function updateMetadata(msg)
+  state.title = msg.title or state.title
+  state.album = msg.album or state.album
+  state.artist = msg.artist or state.artist
+  state.queuePos = msg.queuePos or state.queuePos
+  state.queueLen = msg.queueLen or state.queueLen
+  state.trackIndex = msg.trackIndex or state.trackIndex
+end
+
+local function handleSessionStart(msg)
   if not config.listening then return end
-  if not msg.streamId then return end
+  if not msg.sessionId then return end
 
-  state.lastAnnounceClock = os.clock()
+  state.seqMax = tonumber(msg.seqMax or RADIO_SEQ_MAX) or RADIO_SEQ_MAX
 
-  -- If this announce belongs to a different stream, prepare for it.
-  -- For currentSeq=0, expect chunk 1. For active streams, expect next chunk.
-  if not state.receiving or state.streamId ~= msg.streamId then
-    local currentSeq = tonumber(msg.currentSeq or 0) or 0
-    local expected = currentSeq <= 0 and 1 or currentSeq + 1
-
-    resetStream({
-      streamId = msg.streamId,
-      title = msg.title,
-      album = msg.album,
-      artist = msg.artist,
-      joinSeq = expected
-    }, senderId, currentSeq > 0)
+  if state.sessionId ~= msg.sessionId or not state.receiving or not state.decoder then
+    hardResetSession(msg.sessionId, tonumber(msg.seq or 1) or 1, "New broadcast session.")
   else
-    state.title = msg.title or state.title
-    state.album = msg.album or state.album
-    state.artist = msg.artist or state.artist
+    state.lastStatus = "Session heartbeat/start refreshed."
+    drawStatus()
   end
 end
 
-local function pushChunk(msg, senderId)
+local function handleMetadata(msg)
   if not config.listening then return end
-  if not msg.streamId then return end
+  if not msg.sessionId then return end
+
+  state.seqMax = tonumber(msg.seqMax or state.seqMax or RADIO_SEQ_MAX) or RADIO_SEQ_MAX
+
+  if state.sessionId ~= msg.sessionId then
+    -- Metadata is side-band. It can identify the current station/session, but it
+    -- should not reset decoder or playback unless this is clearly a new session.
+    hardResetSession(msg.sessionId, 1, "Metadata for new session; waiting for audio.")
+  end
+
+  updateMetadata(msg)
+  drawStatus()
+end
+
+local function handleAudio(msg)
+  if not config.listening then return end
+  if not msg.sessionId then return end
   if type(msg.data) ~= "string" then return end
 
   local seq = tonumber(msg.seq)
   if not seq then return end
 
-  -- New stream ID = new song/session. Always hard reset before accepting audio.
-  if not state.receiving or state.streamId ~= msg.streamId then
-    resetStream({
-      streamId = msg.streamId,
-      title = msg.title,
-      album = msg.album,
-      artist = msg.artist,
-      joinSeq = seq
-    }, senderId, seq ~= 1)
+  state.seqMax = tonumber(msg.seqMax or state.seqMax or RADIO_SEQ_MAX) or RADIO_SEQ_MAX
+
+  if state.sessionId ~= msg.sessionId or not state.receiving or not state.decoder then
+    hardResetSession(msg.sessionId, seq, "Late-joined broadcast at seq " .. tostring(seq) .. ".")
   end
 
-  if not state.expectedSeq then
-    state.expectedSeq = seq
-  end
+  if not state.expectedSeq then state.expectedSeq = seq end
 
-  if seq < state.expectedSeq then
-    -- If we just prepared from announce and then chunk 1 arrives, accept it.
-    if seq == 1 and state.chunksReceived == 0 and #state.buffer == 0 then
-      state.expectedSeq = 1
-    else
+  if seq ~= state.expectedSeq then
+    if isSeqOlder(seq, state.expectedSeq) then
       state.chunksDropped = state.chunksDropped + 1
+      state.lastStatus = "Dropped old/out-of-window seq " .. tostring(seq) .. "."
       return
+    else
+      local missed = seqDistanceForward(state.expectedSeq, seq) or 0
+      if missed > 0 then
+        state.outOfOrder = state.outOfOrder + 1
+        state.chunksDropped = state.chunksDropped + missed
+      end
+      state.expectedSeq = seq
+      state.lastStatus = "Skipped forward to seq " .. tostring(seq) .. "."
     end
-  elseif seq > state.expectedSeq then
-    -- Broadcast can lose packets; skip forward instead of deadlocking.
-    state.outOfOrder = state.outOfOrder + 1
-    state.lastStatus = "Skipped missing chunk(s). Expected " .. tostring(state.expectedSeq) .. ", got " .. tostring(seq) .. "."
-    state.expectedSeq = seq
   end
 
   if #state.buffer >= config.maxBufferChunks then
@@ -324,60 +291,33 @@ local function pushChunk(msg, senderId)
   end
 
   table.insert(state.buffer, msg.data)
-  state.expectedSeq = seq + 1
+  state.expectedSeq = seqNext(seq)
   state.chunksReceived = state.chunksReceived + 1
 end
 
 local function radioLoop()
   while true do
     local senderId, msg, protocol = rednet.receive(RADIO_PROTOCOL)
-    if protocol == RADIO_PROTOCOL and type(msg) == "table" and msg.mc == "musiccraft" and msg.version == 1 then
-      if msg.type == "start" then
-        if config.listening then
-          if msg.hardReset or not state.receiving or state.streamId ~= msg.streamId then
-            resetStream(msg, senderId, false)
-          end
-        end
-      elseif msg.type == "announce" then
-        handleAnnounce(msg, senderId)
-      elseif msg.type == "audio" then
-        pushChunk(msg, senderId)
-      elseif msg.type == "end" then
-        if msg.streamId == state.streamId then
-          state.ended = true
-          state.lastStatus = "End received from transmitter."
-          drawStatus()
-        end
-      elseif msg.type == "stop" then
-        if not msg.streamId or msg.streamId == state.streamId then
-          stopStream("transmitter stop")
-        end
-      end
-    end
-  end
-end
 
-local function discoveryLoop()
-  while true do
-    local senderId, msg, protocol = rednet.receive(DISCOVERY_PROTOCOL)
-    if protocol == DISCOVERY_PROTOCOL and type(msg) == "table" then
-      if msg.mc == "musiccraft" and msg.version == 1 and msg.type == "discover_receivers" then
-        rednet.send(senderId, {
-          mc = "musiccraft",
-          version = 1,
-          type = "receiver_announce",
-          name = HOSTNAME,
-          label = os.getComputerLabel(),
-          computerId = os.getComputerID(),
-          speakerCount = speaker and 1 or 0,
-          bufferDepth = #state.buffer,
-          receiving = state.receiving,
-          playing = state.playing,
-          listening = config.listening,
-          volume = config.volume,
-          prebufferChunks = config.prebufferChunks,
-          maxBufferChunks = config.maxBufferChunks,
-        }, DISCOVERY_PROTOCOL)
+    if protocol == RADIO_PROTOCOL and type(msg) == "table" and msg.mc == "musiccraft" and msg.version == 1 then
+      if msg.type == "session_start" then
+        handleSessionStart(msg)
+
+      elseif msg.type == "metadata" then
+        handleMetadata(msg)
+
+      elseif msg.type == "audio" then
+        handleAudio(msg)
+
+      elseif msg.type == "heartbeat" then
+        if msg.sessionId == state.sessionId then
+          state.lastStatus = "Heartbeat received."
+        end
+
+      elseif msg.type == "stop" then
+        if not msg.sessionId or msg.sessionId == state.sessionId then
+          stopSession(msg.reason or "transmitter stop")
+        end
       end
     end
   end
@@ -391,38 +331,38 @@ end
 
 local function playbackLoop()
   local redrawCounter = 0
+
   while true do
     if state.receiving and not state.playing then
       if #state.buffer >= config.prebufferChunks then
         state.playing = true
-        state.lastStatus = "Prebuffer complete. Starting playback."
+        state.lastStatus = "Prebuffer complete. Playing."
         drawStatus()
-      elseif state.ended then
-        stopStream("stream ended before prebuffer complete")
       else
         sleep(0.03)
       end
 
     elseif state.receiving and state.playing then
       local chunk = table.remove(state.buffer, 1)
+
       if chunk then
         local decoded = state.decoder(chunk)
         waitForSpeaker(decoded)
         state.chunksPlayed = state.chunksPlayed + 1
+
         redrawCounter = redrawCounter + 1
         if redrawCounter >= 8 then
           redrawCounter = 0
           drawStatus()
         end
-      elseif state.ended then
-        stopStream("stream ended")
       else
         state.underruns = state.underruns + 1
-        state.lastStatus = "Playback starvation #" .. tostring(state.underruns) .. ". Rebuffering."
         state.playing = false
+        state.lastStatus = "Playback starvation #" .. tostring(state.underruns) .. ". Rebuffering."
         drawStatus()
         sleep(0.05)
       end
+
     else
       sleep(0.1)
     end
@@ -432,8 +372,9 @@ end
 local function inputLoop()
   while true do
     local e, key = os.pullEvent("key")
+
     if key == keys.q then
-      speaker.stop()
+      pcall(function() speaker.stop() end)
       saveConfig()
       term.clear()
       term.setCursorPos(1, 1)
@@ -442,12 +383,12 @@ local function inputLoop()
 
     elseif key == keys.b then
       config.listening = not config.listening
-      if not config.listening then stopStream("receiver left broadcast") end
+      if not config.listening then stopSession("receiver left broadcast") end
       saveConfig()
       drawStatus()
 
     elseif key == keys.s then
-      stopStream("local stop")
+      stopSession("local stop")
 
     elseif key == keys.equals or key == keys.numPadAdd then
       config.volume = math.min(1.0, math.floor((config.volume + 0.1) * 10 + 0.5) / 10)
@@ -483,4 +424,4 @@ local function inputLoop()
 end
 
 drawStatus()
-parallel.waitForAny(radioLoop, discoveryLoop, playbackLoop, inputLoop)
+parallel.waitForAny(radioLoop, playbackLoop, inputLoop)
