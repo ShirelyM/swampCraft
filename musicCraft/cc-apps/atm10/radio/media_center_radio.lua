@@ -54,9 +54,9 @@ local state = {
   commandId = 0,
 
   volumeLevel = DEFAULT_VOLUME_LEVEL,
-  shuffleOn = false,
+  shuffleOn = true,
   loopMode = LOOP_OFF,
-  radioEnabled = false,
+  radioEnabled = true,
 
   bytesRead = 0,
   totalBytes = nil,
@@ -996,6 +996,12 @@ local function main()
 
   state.library = loadMasterCodex()
   drawGui()
+
+  -- Auto-start continuous radio station playback
+  local autoQueue = buildQueueFromContext(1, true)
+  if #autoQueue > 0 then
+    startQueue(autoQueue, 1)
+  end
 
   parallel.waitForAny(uiLoop, playerLoop)
 end
