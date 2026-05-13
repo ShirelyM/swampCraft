@@ -1,5 +1,5 @@
--- VERIFY_MARKER: MC_RADIO_RX_V12_2_LATE_JOIN_ANNOUNCE_AUDIO_FALLBACK_BUFFER_160
--- MusicCraft Radio Receiver v4
+-- VERIFY_MARKER: MC_RADIO_RX_V12_3_TRACK_TRANSITION_POCKET_WIRELESS
+-- MusicCraft Radio Receiver v12.3
 -- Broadcast Receiver with late-join support and non-blocking network intake
 -- CC:Tweaked / ATM10 / No Computronics
 
@@ -56,6 +56,7 @@ local function sanitizeName(name)
 end
 
 local function openWirelessModem()
+  -- Normal computers need an attached wireless modem peripheral.
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       local modem = peripheral.wrap(name)
@@ -65,7 +66,22 @@ local function openWirelessModem()
       end
     end
   end
-  error("No wireless modem found.")
+
+  -- Pocket computers expose their wireless modem internally.
+  -- In CC:Tweaked this is commonly opened as "back" even though it is not
+  -- listed as an attached peripheral.
+  local candidates = { "back", "left", "right", "top", "bottom", "front" }
+  for _, side in ipairs(candidates) do
+    local ok = pcall(function()
+      if not rednet.isOpen(side) then rednet.open(side) end
+    end)
+
+    if ok and rednet.isOpen(side) then
+      return side .. " (internal/pocket)"
+    end
+  end
+
+  error("No wireless modem found. Use a wireless modem or an Advanced Wireless/Noisy Pocket Computer.")
 end
 
 local function ensureComputerLabel()
@@ -124,7 +140,7 @@ local function drawStatus()
   term.clear()
   term.setCursorPos(1, 1)
 
-  print("MusicCraft Radio Receiver v4")
+  print("MusicCraft Radio Receiver v12.3")
   print("============================")
   print("Name:       " .. HOSTNAME)
   print("ID:         " .. os.getComputerID())
@@ -161,7 +177,11 @@ local function resetStream(msg, senderId, join)
   state.artist = msg.artist
   state.decoder = dfpwm.make_decoder()
   state.buffer = {}
+
+  -- For a brand-new song, start expects chunk 1.
+  -- For a late join announce, start near the advertised/current chunk.
   state.expectedSeq = tonumber(msg.joinSeq or msg.currentSeq or 1)
+
   state.receiving = true
   state.playing = false
   state.ended = false
@@ -176,7 +196,7 @@ local function resetStream(msg, senderId, join)
   if join then
     state.lastStatus = "Late-joining active stream near chunk " .. tostring(state.expectedSeq) .. "."
   else
-    state.lastStatus = "Starting stream."
+    state.lastStatus = "Starting new stream at chunk " .. tostring(state.expectedSeq) .. "."
   end
 
   drawStatus()
@@ -199,15 +219,17 @@ local function handleAnnounce(msg, senderId)
 
   state.lastAnnounceClock = os.clock()
 
-  -- If this receiver came online mid-broadcast, announce gives it enough context
-  -- to accept the next audio packet even though it missed the original start.
+  -- Announce packets let late-joining receivers learn about an active stream.
+  -- If this is a new stream, reset immediately so the receiver is ready for audio.
+  -- currentSeq is the transmitter's most recently sent/active chunk, so we expect
+  -- currentSeq + 1 for a true late join.
   if not state.receiving or state.streamId ~= msg.streamId then
     resetStream({
       streamId = msg.streamId,
       title = msg.title,
       album = msg.album,
       artist = msg.artist,
-      currentSeq = tonumber(msg.currentSeq or 1) + 1
+      joinSeq = tonumber(msg.currentSeq or 0) + 1
     }, senderId, true)
   else
     state.title = msg.title or state.title
@@ -221,38 +243,43 @@ local function pushChunk(msg, senderId)
   if not msg.streamId then return end
   if type(msg.data) ~= "string" then return end
 
-  -- Late join fallback: if audio carries metadata and no session exists,
-  -- initialize from the current packet.
+  local seq = tonumber(msg.seq)
+  if not seq then return end
+
+  -- If a new song begins, audio seq=1 must reset the receiver even if an
+  -- announce packet already set expectedSeq to 2. This fixes the track-change
+  -- issue where the receiver had new metadata but never accepted chunk 1.
   if not state.receiving or state.streamId ~= msg.streamId then
     resetStream({
       streamId = msg.streamId,
       title = msg.title,
       album = msg.album,
       artist = msg.artist,
-      joinSeq = msg.seq
-    }, senderId, true)
+      joinSeq = seq
+    }, senderId, seq ~= 1)
   end
-
-  local seq = tonumber(msg.seq)
-  if not seq then return end
 
   if not state.expectedSeq then
     state.expectedSeq = seq
   end
 
   if seq < state.expectedSeq then
-    state.chunksDropped = state.chunksDropped + 1
-    return
+    -- Special case: a new stream can be announced with currentSeq=1, causing
+    -- expectedSeq=2 before chunk 1 arrives. Accept chunk 1 for an empty buffer.
+    if seq == 1 and #state.buffer == 0 and state.chunksReceived == 0 then
+      state.expectedSeq = 1
+    else
+      state.chunksDropped = state.chunksDropped + 1
+      return
+    end
   elseif seq > state.expectedSeq then
-    -- For broadcast audio, do not wait forever on missing packets.
-    -- Jump forward and continue to avoid permanent silence.
+    -- Broadcast can lose packets. Skip forward instead of waiting forever.
     state.outOfOrder = state.outOfOrder + 1
     state.lastStatus = "Skipped missing chunk(s). Expected " .. tostring(state.expectedSeq) .. ", got " .. tostring(seq) .. "."
     state.expectedSeq = seq
   end
 
   if #state.buffer >= config.maxBufferChunks then
-    -- Keep newest audio for broadcast. Dropping oldest prevents runaway latency.
     table.remove(state.buffer, 1)
     state.chunksDropped = state.chunksDropped + 1
     state.lastStatus = "Buffer full; dropped oldest chunk."
@@ -268,7 +295,13 @@ local function radioLoop()
     local senderId, msg, protocol = rednet.receive(RADIO_PROTOCOL)
     if protocol == RADIO_PROTOCOL and type(msg) == "table" and msg.mc == "musiccraft" and msg.version == 1 then
       if msg.type == "start" then
-        if config.listening then resetStream(msg, senderId, msg.joinSeq ~= nil) end
+        if config.listening then
+          -- A start packet always defines a new stream/session when streamId changes.
+          -- For same streamId, do not constantly reset duplicate starts.
+          if not state.receiving or state.streamId ~= msg.streamId then
+            resetStream(msg, senderId, false)
+          end
+        end
       elseif msg.type == "announce" then
         handleAnnounce(msg, senderId)
       elseif msg.type == "audio" then

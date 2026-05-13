@@ -1,4 +1,4 @@
--- VERIFY_MARKER: MC_RADIO_TX_V12_2_LATE_JOIN_ANNOUNCE_METADATA_PACE_093
+-- VERIFY_MARKER: MC_RADIO_TX_V12_3_TRACK_TRANSITION_STARTSEQ0
 -- MusicCraft Media Center v12 Broadcast TX
 -- CC:Tweaked / ATM10 / Streaming DFPWM / Monitor GUI / Broadcast Radio Transmitter
 
@@ -625,7 +625,7 @@ local function playBroadcastQueueItem(response, item, commandId)
     album = item.album.album,
     artist = item.album.artist,
     chunkSize = RADIO_CHUNK_SIZE,
-    currentSeq = 1,
+    currentSeq = 0,
     status = "playing"
   }
 
