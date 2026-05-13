@@ -1,6 +1,7 @@
--- VERIFY_MARKER: MC_RADIO_RX_V13_CONTINUOUS_SESSION
--- MusicCraft Radio Receiver v13
+-- VERIFY_MARKER: MC_RADIO_RX_V14_MULTI_SPEAKER_MONITOR
+-- MusicCraft Radio Receiver v14
 -- CC:Tweaked / ATM10 / Continuous Broadcast DFPWM Receiver
+-- Adds wired-network multi-speaker playback and optional monitor Now Playing UI.
 
 local RADIO_PROTOCOL = "musiccraft.radio.v1"
 local ROLE_PREFIX = "musiccraft-rx"
@@ -12,6 +13,7 @@ local DEFAULT_CONFIG = {
   prebufferChunks = 12,
   maxBufferChunks = 160,
   listening = true,
+  autoRefreshSpeakers = true,
 }
 
 local dfpwm = require("cc.audio.dfpwm")
@@ -92,11 +94,11 @@ local function claimUniqueHostname()
   return desiredName
 end
 
-local speaker = peripheral.find("speaker")
-if not speaker then error("No attached speaker found.") end
-
 local modemName = openWirelessModem()
 local HOSTNAME = claimUniqueHostname()
+
+local mon = peripheral.find("monitor")
+if mon then mon.setTextScale(1) end
 
 local state = {
   sessionId = nil,
@@ -111,6 +113,11 @@ local state = {
   buffer = {},
   expectedSeq = nil,
   seqMax = RADIO_SEQ_MAX,
+
+  speakers = {},
+  speakerNames = {},
+  speakerCount = 0,
+  lastSpeakerRefresh = 0,
 
   receiving = false,
   playing = false,
@@ -143,43 +150,146 @@ local function isSeqOlder(seq, expected)
   return forward > (maxSeq / 2)
 end
 
+local function trim(s, n)
+  s = tostring(s or "")
+  if n <= 0 then return "" end
+  if #s <= n then return s end
+  if n <= 3 then return s:sub(1, n) end
+  return s:sub(1, n - 3) .. "..."
+end
+
+local function refreshSpeakers(force)
+  local now = os.clock()
+  if not force and now - state.lastSpeakerRefresh < 2 then return end
+
+  state.lastSpeakerRefresh = now
+  state.speakers = {}
+  state.speakerNames = {}
+
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "speaker" then
+      local wrapped = peripheral.wrap(name)
+      if wrapped then
+        table.insert(state.speakers, wrapped)
+        table.insert(state.speakerNames, name)
+      end
+    end
+  end
+
+  state.speakerCount = #state.speakers
+end
+
+local function stopSpeakers()
+  refreshSpeakers(true)
+  for _, s in ipairs(state.speakers) do
+    pcall(function() s.stop() end)
+  end
+end
+
+local function writeTermLine(label, value)
+  print(label .. tostring(value))
+end
+
+local function drawMonitor()
+  if not mon then return end
+
+  local w, h = mon.getSize()
+  mon.setBackgroundColor(colors.black)
+  mon.setTextColor(colors.white)
+  mon.clear()
+
+  local function writeAt(x, y, text, fg, bg)
+    if y < 1 or y > h then return end
+    mon.setCursorPos(x, y)
+    mon.setTextColor(fg or colors.white)
+    mon.setBackgroundColor(bg or colors.black)
+    mon.write(trim(text, math.max(0, w - x + 1)))
+  end
+
+  local function fill(y, bg)
+    if y < 1 or y > h then return end
+    mon.setCursorPos(1, y)
+    mon.setBackgroundColor(bg)
+    mon.write(string.rep(" ", w))
+  end
+
+  fill(1, colors.blue)
+  writeAt(2, 1, "MusicCraft Radio", colors.white, colors.blue)
+
+  local status = "Idle"
+  if not config.listening then
+    status = "Muted / Not Listening"
+  elseif state.playing then
+    status = "Playing"
+  elseif state.receiving then
+    status = "Buffering"
+  end
+
+  writeAt(2, 3, "Status:  " .. status, colors.lime)
+  writeAt(2, 4, "Artist:  " .. tostring(state.artist or "-"))
+  writeAt(2, 5, "Album:   " .. tostring(state.album or "-"))
+  writeAt(2, 6, "Song:    " .. tostring(state.title or "-"), colors.yellow)
+
+  if h >= 9 then
+    writeAt(2, 8, "Speakers: " .. tostring(state.speakerCount) .. "  Buffer: " .. tostring(#state.buffer))
+    writeAt(2, 9, "Volume:   " .. tostring(config.volume))
+  end
+
+  if h >= 11 then
+    writeAt(2, 11, "Queue:    " .. tostring(state.queuePos or "-") .. "/" .. tostring(state.queueLen or "-"))
+  end
+
+  if h >= 13 then
+    writeAt(2, 13, "Session:  " .. tostring(state.sessionId or "-"))
+  end
+
+  if h >= 15 then
+    writeAt(2, 15, trim(state.lastStatus or "", w - 2), colors.lightGray)
+  end
+end
+
 local function drawStatus()
+  refreshSpeakers(false)
+
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.white)
   term.clear()
   term.setCursorPos(1, 1)
 
-  print("MusicCraft Radio Receiver v13")
+  print("MusicCraft Radio Receiver v14")
   print("==============================")
-  print("Name:       " .. HOSTNAME)
-  print("ID:         " .. os.getComputerID())
-  print("Modem:      " .. tostring(modemName))
-  print("Listening:  " .. tostring(config.listening))
-  print("Volume:     " .. tostring(config.volume))
-  print("Prebuffer:  " .. tostring(config.prebufferChunks))
-  print("Max Buffer: " .. tostring(config.maxBufferChunks))
-  print("Buffer:     " .. tostring(#state.buffer))
-  print("Receiving:  " .. tostring(state.receiving))
-  print("Playing:    " .. tostring(state.playing))
-  print("Title:      " .. tostring(state.title or "-"))
-  print("Artist:     " .. tostring(state.artist or "-"))
-  print("Album:      " .. tostring(state.album or "-"))
-  print("Queue:      " .. tostring(state.queuePos or "-") .. "/" .. tostring(state.queueLen or "-"))
-  print("Session:    " .. tostring(state.sessionId or "-"))
-  print("Expected:   " .. tostring(state.expectedSeq or "-"))
-  print("Received:   " .. tostring(state.chunksReceived))
-  print("Played:     " .. tostring(state.chunksPlayed))
-  print("Dropped:    " .. tostring(state.chunksDropped))
-  print("OutOrder:   " .. tostring(state.outOfOrder))
-  print("Underruns:  " .. tostring(state.underruns))
+  writeTermLine("Name:       ", HOSTNAME)
+  writeTermLine("ID:         ", os.getComputerID())
+  writeTermLine("Modem:      ", modemName)
+  writeTermLine("Listening:  ", config.listening)
+  writeTermLine("Volume:     ", config.volume)
+  writeTermLine("Prebuffer:  ", config.prebufferChunks)
+  writeTermLine("Max Buffer: ", config.maxBufferChunks)
+  writeTermLine("Speakers:   ", state.speakerCount)
+  writeTermLine("Buffer:     ", #state.buffer)
+  writeTermLine("Receiving:  ", state.receiving)
+  writeTermLine("Playing:    ", state.playing)
+  writeTermLine("Title:      ", state.title or "-")
+  writeTermLine("Artist:     ", state.artist or "-")
+  writeTermLine("Album:      ", state.album or "-")
+  writeTermLine("Queue:      ", tostring(state.queuePos or "-") .. "/" .. tostring(state.queueLen or "-"))
+  writeTermLine("Session:    ", state.sessionId or "-")
+  writeTermLine("Expected:   ", state.expectedSeq or "-")
+  writeTermLine("Received:   ", state.chunksReceived)
+  writeTermLine("Played:     ", state.chunksPlayed)
+  writeTermLine("Dropped:    ", state.chunksDropped)
+  writeTermLine("OutOrder:   ", state.outOfOrder)
+  writeTermLine("Underruns:  ", state.underruns)
   print()
-  print("Keys: b listen | +/- vol | [/] prebuf | {/} maxbuf | s stop | q quit")
+  print("Keys: b listen | +/- vol | [/] prebuf | {/} maxbuf | a auto-speakers | s stop | q quit")
   print()
   print(state.lastStatus or "")
+
+  drawMonitor()
 end
 
 local function hardResetSession(sessionId, startSeq, reason)
-  pcall(function() speaker.stop() end)
+  stopSpeakers()
 
   state.sessionId = sessionId
   state.decoder = dfpwm.make_decoder()
@@ -200,7 +310,7 @@ local function hardResetSession(sessionId, startSeq, reason)
 end
 
 local function stopSession(reason)
-  pcall(function() speaker.stop() end)
+  stopSpeakers()
 
   state.receiving = false
   state.playing = false
@@ -243,8 +353,6 @@ local function handleMetadata(msg)
   state.seqMax = tonumber(msg.seqMax or state.seqMax or RADIO_SEQ_MAX) or RADIO_SEQ_MAX
 
   if state.sessionId ~= msg.sessionId then
-    -- Metadata is side-band. It can identify the current station/session, but it
-    -- should not reset decoder or playback unless this is clearly a new session.
     hardResetSession(msg.sessionId, 1, "Metadata for new session; waiting for audio.")
   end
 
@@ -323,9 +431,45 @@ local function radioLoop()
   end
 end
 
-local function waitForSpeaker(buffer)
-  while not speaker.playAudio(buffer, config.volume) do
+local function waitForAllSpeakers(buffer)
+  refreshSpeakers(false)
+
+  if state.speakerCount == 0 then
+    state.lastStatus = "No speakers found. Connect local or wired-network speakers."
+    drawStatus()
+    sleep(0.5)
+    return false
+  end
+
+  local pending = {}
+  for i = 1, #state.speakers do pending[i] = true end
+
+  while true do
+    local waiting = false
+    local playedAny = false
+
+    for i, speaker in ipairs(state.speakers) do
+      if pending[i] then
+        local ok = false
+        pcall(function()
+          ok = speaker.playAudio(buffer, config.volume)
+        end)
+
+        if ok then
+          pending[i] = false
+          playedAny = true
+        else
+          waiting = true
+        end
+      end
+    end
+
+    if not waiting then return true end
+
+    -- If at least one speaker accepted the buffer, allow the full speaker event
+    -- cycle before trying the remaining speakers again.
     os.pullEvent("speaker_audio_empty")
+    if config.autoRefreshSpeakers then refreshSpeakers(false) end
   end
 end
 
@@ -333,10 +477,12 @@ local function playbackLoop()
   local redrawCounter = 0
 
   while true do
+    if config.autoRefreshSpeakers then refreshSpeakers(false) end
+
     if state.receiving and not state.playing then
       if #state.buffer >= config.prebufferChunks then
         state.playing = true
-        state.lastStatus = "Prebuffer complete. Playing."
+        state.lastStatus = "Prebuffer complete. Playing to " .. tostring(state.speakerCount) .. " speaker(s)."
         drawStatus()
       else
         sleep(0.03)
@@ -347,8 +493,8 @@ local function playbackLoop()
 
       if chunk then
         local decoded = state.decoder(chunk)
-        waitForSpeaker(decoded)
-        state.chunksPlayed = state.chunksPlayed + 1
+        local ok = waitForAllSpeakers(decoded)
+        if ok then state.chunksPlayed = state.chunksPlayed + 1 end
 
         redrawCounter = redrawCounter + 1
         if redrawCounter >= 8 then
@@ -374,7 +520,7 @@ local function inputLoop()
     local e, key = os.pullEvent("key")
 
     if key == keys.q then
-      pcall(function() speaker.stop() end)
+      stopSpeakers()
       saveConfig()
       term.clear()
       term.setCursorPos(1, 1)
@@ -389,6 +535,12 @@ local function inputLoop()
 
     elseif key == keys.s then
       stopSession("local stop")
+
+    elseif key == keys.a then
+      config.autoRefreshSpeakers = not config.autoRefreshSpeakers
+      refreshSpeakers(true)
+      saveConfig()
+      drawStatus()
 
     elseif key == keys.equals or key == keys.numPadAdd then
       config.volume = math.min(1.0, math.floor((config.volume + 0.1) * 10 + 0.5) / 10)
@@ -423,5 +575,6 @@ local function inputLoop()
   end
 end
 
+refreshSpeakers(true)
 drawStatus()
 parallel.waitForAny(radioLoop, playbackLoop, inputLoop)
