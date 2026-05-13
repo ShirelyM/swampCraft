@@ -1,4 +1,4 @@
--- VERIFY_MARKER: MC_RADIO_TX_V12_3_TRACK_TRANSITION_STARTSEQ0
+-- VERIFY_MARKER: MC_RADIO_TX_V12_4_EXPLICIT_TRACK_BOUNDARY
 -- MusicCraft Media Center v12 Broadcast TX
 -- CC:Tweaked / ATM10 / Streaming DFPWM / Monitor GUI / Broadcast Radio Transmitter
 
@@ -7,6 +7,7 @@ local MASTER_CODEX_URL = "https://raw.githubusercontent.com/ShirelyM/swampCraft/
 local LOCAL_CHUNK_SIZE = 16 * 1024
 local RADIO_CHUNK_SIZE = 8 * 1024
 local RADIO_PACE_FACTOR = 0.93
+local RADIO_TRACK_GAP = 0.35
 local RADIO_ANNOUNCE_EVERY_CHUNKS = 8
 local RADIO_ANNOUNCE_INTERVAL = 1.0
 
@@ -615,6 +616,18 @@ local function playBroadcastQueueItem(response, item, commandId)
     return
   end
 
+  -- Explicit track boundary: tell receivers to fully close any prior stream
+  -- before the next song starts. This prevents stale playback state from
+  -- carrying across queue items.
+  if state.radioStreamId then
+    radioBroadcast({
+      type = "stop",
+      streamId = state.radioStreamId,
+      reason = "next_track"
+    })
+    sleep(RADIO_TRACK_GAP)
+  end
+
   state.radioStreamId = makeStreamId()
   state.radioSeq = 1
 
@@ -643,7 +656,8 @@ local function playBroadcastQueueItem(response, item, commandId)
     album = item.album.album,
     artist = item.album.artist,
     chunkSize = RADIO_CHUNK_SIZE,
-    joinSeq = 1
+    joinSeq = 1,
+    hardReset = true
   })
 
   local announceTimer = os.startTimer(RADIO_ANNOUNCE_INTERVAL)
@@ -687,7 +701,7 @@ local function playBroadcastQueueItem(response, item, commandId)
   end
 
   if state.radioStreamId then
-    radioBroadcast({ type = "end", streamId = state.radioStreamId })
+    radioBroadcast({ type = "end", streamId = state.radioStreamId, finalSeq = state.radioSeq - 1 })
   end
 end
 
